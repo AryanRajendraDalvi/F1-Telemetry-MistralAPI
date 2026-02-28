@@ -1,0 +1,8 @@
+node_modules/
+build/
+f1_cache/
+*.node
+*.o
+*.a
+*.so
+.DS_Store
