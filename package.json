@@ -10,7 +10,11 @@
   "license": "ISC",
   "description": "",
   "dependencies": {
+    "@mistralai/mistralai": "^1.14.1",
+    "blessed": "^0.1.81",
+    "blessed-contrib": "^4.11.0",
     "csv-parser": "^3.2.0",
+    "dotenv": "^17.3.1",
     "express": "^5.2.1",
     "node-addon-api": "^8.6.0",
     "socket.io": "^4.8.3"

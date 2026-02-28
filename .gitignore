@@ -6,3 +6,5 @@ f1_cache/
 *.a
 *.so
 .DS_Store
+.env
+    
