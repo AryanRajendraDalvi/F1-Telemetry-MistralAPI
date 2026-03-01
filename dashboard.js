@@ -30,8 +30,9 @@ try {
     process.exit(1);
 }
 
-// Randomize starting grid position (P1-P20)
-const startingPosition = Math.floor(Math.random() * 20) + 1;
+// Randomize starting grid position (P1-P20) with uniform distribution
+// Using ceil ensures we get exactly 1-20 with equal probability
+const startingPosition = Math.ceil(Math.random() * 20);
 
 // Initialize strategy modules
 const weatherAnalyzer = new WeatherAnalyzer();
@@ -348,49 +349,120 @@ function handleAiDecision(lap, dropObj, currentP, currentCliff) {
         const maxLapsForCompound = tireStrategy.getMaxLaps(currentTireCompound);
         const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
 
-        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to pit now or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
+        // ==========================================
+        // CALCULATE PIT WINDOW MATHEMATICS
+        // ==========================================
+        const remainingRaceLaps = Math.max(0, 44 - lap);
+        const degradationPerLap = 0.8; // seconds per lap when cliff is active
+        const pitCost = 24; // Fixed pit stop time loss in seconds
+        const tireTempLoss = 3; // Additional seconds for tire warm-up
+        const totalPitCost = pitCost + (Math.random() * tireTempLoss); // 24-27s range
+        
+        // Degradation cost if we stay out: how much time we lose from tire wear
+        const degradationCost = (currentCliff * degradationPerLap * remainingRaceLaps);
+        
+        // Should we pit mathematically?
+        const shouldPitMath = degradationCost > totalPitCost + 3; // 3s safety buffer
+        
+        // Position value: P1=25pts, P2=18pts, P3=15pts... P10=1pt
+        const positionPoints = {1: 25, 2: 18, 3: 15, 4: 12, 5: 10, 6: 8, 7: 6, 8: 4, 9: 2, 10: 1};
+        const currentPts = positionPoints[raceState.currentPosition] || 0;
+        const postPitPosition = pitImpact.newPosition;
+        const postPitPts = positionPoints[postPitPosition] || 0;
+        const pointsLossToPit = currentPts - postPitPts;
+        const pointsLossInSeconds = pointsLossToPit * 0.5; // 1 point = 0.5 seconds tolerance
 
-CRITICAL RULES:
-- PODIUM PROTECTION: If in P1-P3, ONLY pit if Cliff > 85% AND more than 10 laps remaining. Podium > everything else.
-- PIT (BOX) if: (Cliff Prob > 75% AND not podium) OR Fuel < 10 laps, OR degradation multiplier > 3.0, OR strategic advantage clear
-- STAY OUT if: Tire is FRESH/NORMAL, Cliff < 65%, fuel adequate - early pits waste races. ESPECIALLY if in podium position.
-- TIRE AGE: Each compound has realistic lifespan. Softs degrade fastest (18 laps max), Hards last longest (40 laps max)
-- Each pit stop costs ${timeLossStr} - must be justified. AVOID if in podium unless catastrophic tire failure.
+        const prompt = `You are the ELITE F1 race strategist. YOU MUST USE CHAIN-OF-THOUGHT reasoning with mathematical rigor. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "step-by-step math + decision", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
 
-TIRE COMPOUND LIFETIMES (max safe laps):
-- SOFT: 18 laps (aggressive degradation late-stint)
-- MEDIUM: 28 laps (balanced wear)
-- HARD: 40 laps (conservative degradation)
+=== HARD MATHEMATICAL CONSTRAINTS (These override gut feel) ===
 
-TELEMETRY (Lap ${lap}):
-- Current Tires: ${currentTireCompound}
-- Laps on Current Tires: ${lapsSinceLastPit}/${maxLapsForCompound} (${Math.round((lapsSinceLastPit/maxLapsForCompound)*100)}% of lifespan)
-- Tire Wear Status: ${tireWearStatus}
-- Degradation Curve Multiplier: ${degradationMultiplier.toFixed(2)}x (1.0=normal, 4.0+=critical cliff)
-- Cliff Probability: ${(currentCliff * 100).toFixed(1)}% (CRITICAL if >75%)
-- True Tire Wear: ${dropObj.toFixed(3)}s
-- Pit Stops Made: ${pitStopCount}
+CONSTRAINT 1: PIT WINDOW CALCULATION
+- Pit Cost (fixed): ${totalPitCost.toFixed(1)}s pit stop + warm-up
+- Degradation Cost (if stay out): Cliff% × remaining_laps × 0.8s/lap
+- Current: ${(currentCliff * 100).toFixed(1)}% cliff × ${remainingRaceLaps} laps = ${degradationCost.toFixed(1)}s
+- Decision Rule: If Degradation Cost > Pit Cost + 3s buffer → STRONG PIT signal
 
-POSITION & GAP:
-- Current Position: P${raceState.currentPosition} ${raceState.currentPosition <= 3 ? '🏆 PODIUM POSITION - PROTECT!' : ''}
-- Gap to Leader: ${raceState.gapToLeader.toFixed(3)}s
-- PIT IMPACT: Lose ${timeLossStr} → P${pitImpact.newPosition}
+CONSTRAINT 2: POSITION VALUE FORMULA
+- Your position P${raceState.currentPosition} = ${currentPts} points
+- Post-pit position P${postPitPosition} = ${postPitPts} points
+- Points at risk: ${pointsLossToPit} points = max tolerate ${pointsLossInSeconds.toFixed(1)}s loss
+- Decision Rule: Only pit if point loss < tire degradation savings
 
-FUEL SITUATION:
-- Fuel: ${fuelStatus.currentFuel}kg (${fuelStatus.percentage}%)
-- Laps Remaining: ${fuelStrategy.getLapsRemaining(lap)}
-- Avg Consumption: ${fuelStatus.avgConsumption}kg/lap
-${fuelStatus.critical ? '⚠️  CRITICAL LOW FUEL' : fuelStatus.warning ? '⚠️  LOW FUEL' : '✓ Fuel OK'}
+CONSTRAINT 3: CLIFF PROBABILITY THRESHOLDS
+- Cliff < 50%: GREEN ZONE - Extend tires, no urgency
+- Cliff 50-65%: YELLOW-GREEN - Monitor, consider options
+- Cliff 65-75%: YELLOW ZONE - Pit within next 2-3 laps
+- Cliff 75-85%: RED ZONE - Pit this lap (high risk/reward)
+- Cliff > 85%: CRITICAL - Immediate pit, risk of DNF
 
-WEATHER:
-- Current: ${weatherData.condition}
-- Grip: ${weatherData.gripLevel}
-- Recommended Compound: ${weatherData.recommendedTireCompound}
-${weatherData.riskFactors.length > 0 ? '- Risks: ' + weatherData.riskFactors.join(', ') : ''}
+=== FEW-SHOT EXAMPLES (Think like these) ===
 
-STRATEGY ANALYSIS:
-- Total Pit Urgency: ${pitAnalysis.totalUrgency}/10
-- Reasons: ${pitAnalysis.reason.slice(0, 2).join('; ')}`;
+EXAMPLE 1 - Podium Math at Spa (P2, Lap 35/44, 9 laps left):
+Situation: P2 in podium, SOFT on lap 16/18, Cliff 82%, +1.2s gap to P3
+Math:
+  - Degradation: 82% × 9 × 0.8 = 5.9s (if stay out)
+  - Pit cost: 24s + tire warm-up
+  - But: Fresh SOFT tires = +2s/lap advantage × 8 laps = 16s gain
+  - Net: -24 + 16 = -8s (lose position temporarily but regain it)
+  - Position math: P2 (18pts) → P3 (15pts) = 3pts loss = 1.5s tolerance
+  - Verdict: PIT (gain tires beats tire degradation + regain P2 in final laps)
+  - Confidence: 92%
+
+EXAMPLE 2 - Stay Out Math at Monza (P4, Lap 25/44, 19 laps left):
+Situation: P4, HARD on lap 12/40 (30% used), Cliff 45%, -0.8s gap to P3
+Math:
+  - Degradation: 45% × 19 × 0.8 = 6.8s (if stay out)
+  - Pit cost: 24s (losing 24s >> 6.8s degradation)
+  - Fresh tires: Would match P3 pace but 24s cost too high
+  - Position math: P4 (12pts) → P5 (10pts) = 2pts = 1s tolerance
+  - Verdict: STAY OUT (tire fresh, degradation manageable, 24s pit cost unjustified)
+  - Confidence: 88%
+
+EXAMPLE 3 - Undercut Strategy at Belgium (P3, Lap 18/44, 26 laps left):
+Situation: P3, SOFT on lap 13/18 (72% used), Cliff 68%, -2.1s gap to P2
+Math:
+  - Degradation: 68% × 26 × 0.8 = 14.2s (tire cliff will hurt bad)
+  - Pit cost: 24s
+  - BUT: P2 expected to pit lap 20 (predicted)
+  - I pit lap 19 (one lap early) = undercut = -3s advantage
+  - Net: -24 + 3 + 14.2 = -6.8s (slight loss BUT swap to P2 position)
+  - Position math before pit: P3 (15pts) → P4 (12pts) = 3pts = 1.5s
+  - Position math after undercut: P3→P2 = +3pts regained = worth it
+  - Verdict: PIT LAP 19 (undercut window + tire age)
+  - Confidence: 85%
+
+=== NOW YOUR SITUATION (Lap ${lap}/${44}) ===
+
+CURRENT STATE:
+- Position: P${raceState.currentPosition} (${currentPts} points) | Gap: ${raceState.gapToLeader.toFixed(3)}s ${raceState.currentPosition <= 3 ? '🏆 PODIUM' : ''}
+- Tires: ${currentTireCompound} (${lapsSinceLastPit}/${maxLapsForCompound} = ${Math.round((lapsSinceLastPit/maxLapsForCompound)*100)}%)
+- Cliff: ${(currentCliff * 100).toFixed(1)}% (${currentCliff > 0.85 ? 'CRITICAL' : currentCliff > 0.75 ? 'RED' : currentCliff > 0.65 ? 'YELLOW' : 'GREEN'} zone)
+- Fuel: ${fuelStatus.currentFuel}kg (${fuelStatus.percentage}%) | Laps: ${remainingRaceLaps}
+
+MATHEMATICAL ANALYSIS:
+Step 1 - Pit Window Math:
+  Degradation Cost (stay): ${degradationCost.toFixed(1)}s
+  Pit Cost (go): ${totalPitCost.toFixed(1)}s
+  Verdict: ${shouldPitMath ? 'MATH FAVORS PITTING' : 'MATH FAVORS STAYING OUT'}
+
+Step 2 - Position Value:
+  Risk losing ${pointsLossToPit} points (${pointsLossInSeconds.toFixed(1)}s equivalent)
+  Can recover with: Fresh tires? Track position? ${raceState.currentPosition <= 5 ? 'Remaining laps to overtake?' : 'Strategic opportunity?'}
+
+Step 3 - Tire Status:
+  ${tireWearStatus === 'FRESH' ? 'Tires still FRESH - extend?' : tireWearStatus === 'NORMAL' ? 'Tires NORMAL - manageable' : tireWearStatus === 'WARNING' ? 'WARNING - pit soon but not now' : 'CRITICAL - pit immediately'}
+
+Step 4 - Other Factors:
+  Weather: ${weatherData.condition} | Fuel risk: ${fuelStatus.critical ? 'YES' : fuelStatus.warning ? 'MEDIUM' : 'NO'}
+
+FINAL DECISION:
+Based on pit window math (${shouldPitMath ? 'supports pit' : 'supports staying'}), position value (${pointsLossToPit > 3 ? 'too risky' : 'manageable'}), and tire status (${tireWearStatus}):
+- If ${currentCliff > 0.85}: MANDATORY PIT (red zone + tire age)
+- If ${shouldPitMath && currentCliff > 0.65}: PIT (math + cliff level)
+- If ${currentCliff < 0.50}: STAY OUT (math doesn't support it)
+- Otherwise: Weighted by urgency (${pitAnalysis.totalUrgency}/10)
+
+Factors: Cliff=${(currentCliff * 100).toFixed(1)}%, Math=${shouldPitMath ? 'FAVOR' : 'AGAINST'}, Position=${raceState.currentPosition <= 3 ? 'PROTECT' : 'NORMAL'}, Fuel=${fuelStatus.critical ? 'CRITICAL' : 'OK'}`;
 
         client.chat.complete({
             model: 'mistral-large-latest',
@@ -408,17 +480,25 @@ STRATEGY ANALYSIS:
                 agentTerminal.log(`Urgency: ${pitAnalysis.totalUrgency}/10 | Cliff: ${(currentCliff * 100).toFixed(1)}%`);
                 agentTerminal.log(`Decision:   \x1b[35m${parsed.decision}\x1b[0m`);
                 agentTerminal.log(`Confidence: \x1b[36m${(parsed.confidence * 100).toFixed(1)}%\x1b[0m`);
+
                 agentTerminal.log(`Pit Impact: ${timeLossStr}`);
                 agentTerminal.log(`Tire Choice: ${tireRec}`);
                 agentTerminal.log(`Reasoning:`);
                 wrapAndLog(agentTerminal, reasoning, 45);
                 agentTerminal.log(`-----------------------------`);
 
-                if (parsed.decision === 'BOX' && pitAnalysis.totalUrgency > 3) {
+                // Trust AI decisions: if it says BOX with reasonable confidence, execute pit stop
+                if (parsed.decision === 'BOX' && parsed.confidence >= 0.65) {
                     executePitStop = true;
                     positionBeforePit = raceState.currentPosition;
-                } else if (parsed.decision === 'BOX' && pitAnalysis.totalUrgency <= 3) {
-                    agentTerminal.log(`⚠️  BOX recommended but urgency low - analyzing...`);
+                    agentTerminal.log(`✅ Executing pit stop (Confidence: ${(parsed.confidence * 100).toFixed(0)}%)`);
+                } else if (parsed.decision === 'BOX' && parsed.confidence < 0.65 && pitAnalysis.totalUrgency > 5) {
+                    // Execute pit if urgency is genuinely high, even with lower confidence
+                    executePitStop = true;
+                    positionBeforePit = raceState.currentPosition;
+                    agentTerminal.log(`✅ Forced pit (Urgency critical: ${pitAnalysis.totalUrgency}/10)`);
+                } else if (parsed.decision === 'BOX' && parsed.confidence < 0.65) {
+                    agentTerminal.log(`⏳ BOX recommended but confidence low (${(parsed.confidence * 100).toFixed(0)}%) - STAYING OUT`);
                 }
             } catch (err) {
                 try {
@@ -434,9 +514,15 @@ STRATEGY ANALYSIS:
                     wrapAndLog(agentTerminal, reasoningFallback, 45);
                     agentTerminal.log(`-----------------------------`);
 
-                    if (parsedFallback.decision === 'BOX' && pitAnalysis.totalUrgency > 3) {
+                    // Trust AI decisions in fallback too
+                    if (parsedFallback.decision === 'BOX' && parsedFallback.confidence >= 0.65) {
                         executePitStop = true;
                         positionBeforePit = raceState.currentPosition;
+                        agentTerminal.log(`✅ [FALLBACK] Executing pit stop (Confidence: ${(parsedFallback.confidence * 100).toFixed(0)}%)`);
+                    } else if (parsedFallback.decision === 'BOX' && pitAnalysis.totalUrgency > 5) {
+                        executePitStop = true;
+                        positionBeforePit = raceState.currentPosition;
+                        agentTerminal.log(`✅ [FALLBACK] Forced pit (Urgency: ${pitAnalysis.totalUrgency}/10)`);
                     }
                 } catch (fallbackErr) {
                     agentTerminal.log(`[Error parsing API response]: ${err.message}`);
@@ -493,16 +579,6 @@ function startRaceSimulation() {
                     // Only 15% chance of rain (less aggressive than before)
                     raceState.rainfall = Math.random() < 0.15 ? Math.random() * 3 : 0;
                 }
-
-                // Simulate position changes (±1 position randomly)
-                if (Math.random() < 0.1) {
-                    const posChange = Math.random() < 0.5 ? -1 : 1;
-                    raceState.currentPosition = Math.max(1, Math.min(20, raceState.currentPosition + posChange));
-                }
-
-                // Simulate gap development
-                raceState.gapToLeader += (Math.random() - 0.4) * 0.3;
-                raceState.gapToLeader = Math.max(0, raceState.gapToLeader);
 
                 // Update tire strategy info
                 tireStrategy.updateCurrentStint(actualLap, state.x, raceState.currentPosition, `${raceState.trackTemp.toFixed(0)}°C`);
@@ -602,6 +678,49 @@ function startRaceSimulation() {
 
                     state.x = result.x;
                     state.P = result.P;
+
+                    // ==========================================
+                    // REALISTIC POSITION DYNAMICS (based on tire condition)
+                    // ==========================================
+                    const tireAgePercent = lapsSinceLastPit / tireStrategy.getMaxLaps(currentTireCompound);
+                    
+                    // Calculate position change based on tire condition and cliff probability
+                    let positionChange = 0;
+                    if (tireAgePercent < 0.4) {
+                        // Fresh tires: GAIN 1 position every 5-8 laps (better chance to overtake)
+                        if (result.cliffProb < 0.6 && Math.random() < 0.20) {
+                            positionChange = -1; // -1 = better position (lower number)
+                        }
+                    } else if (tireAgePercent > 0.8) {
+                        // Degraded tires: Lose 1 position only in critical cliff (fair chance to defend)
+                        if (result.cliffProb > 0.75 && Math.random() < 0.15) {
+                            positionChange = 1; // +1 = worse position (higher number)
+                        }
+                    } else {
+                        // Normal operation: balanced - gain if catching up, lose only in critical situations
+                        if (raceState.gapToLeader < 0.5 && Math.random() < 0.12) {
+                            positionChange = -1; // Catching up leader - gain position
+                        } else if (result.cliffProb > 0.80 && Math.random() < 0.08) {
+                            positionChange = 1; // Only lose in critical cliff (> 80%)
+                        }
+                    }
+                    
+                    // Apply realistic position change
+                    if (positionChange !== 0) {
+                        raceState.currentPosition = Math.max(1, Math.min(20, raceState.currentPosition + positionChange));
+                    }
+
+                    // ==========================================
+                    // REALISTIC GAP DEVELOPMENT
+                    // ==========================================
+                    // Gap should naturally decrease (we catch up) unless tires are critical
+                    const baseGapChange = -0.03; // Natural gain (catching up)
+                    const cliffPenalty = Math.max(0, (result.cliffProb - 0.65) * 0.15); // Only penalize if cliff > 65%
+                    const tireAdvantage = tireAgePercent < 0.35 ? -0.08 : 0; // Fresh tires help close gap
+                    const degradationPenalty = tireAgePercent > 0.90 ? 0.10 : 0; // Only late in stint (>90%)
+                    
+                    raceState.gapToLeader += baseGapChange + cliffPenalty + tireAdvantage + degradationPenalty;
+                    raceState.gapToLeader = Math.max(0, raceState.gapToLeader);
 
                     // Simulate driving intensity and fuel consumption
                     const drivingIntensity = result.cliffProb > 0.5 ? 'AGGRESSIVE' : 'NORMAL';
