@@ -349,21 +349,31 @@ function handleAiDecision(lap, dropObj, currentP, currentCliff) {
         const maxLapsForCompound = tireStrategy.getMaxLaps(currentTireCompound);
         const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
 
-        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to pit now or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
+        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to box or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
 
-CRITICAL RULES:
-- PODIUM PROTECTION: If in P1-P3, ONLY pit if Cliff > 85% AND more than 10 laps remaining. Podium > everything else.
-- PIT (BOX) if: (Cliff Prob > 75% AND not podium) OR Fuel < 10 laps, OR degradation multiplier > 3.0, OR strategic advantage clear
-- STAY OUT if: Tire is FRESH/NORMAL, Cliff < 65%, fuel adequate - early pits waste races. ESPECIALLY if in podium position.
-- TIRE AGE: Each compound has realistic lifespan. Softs degrade fastest (18 laps max), Hards last longest (40 laps max)
-- Each pit stop costs ${timeLossStr} - must be justified. AVOID if in podium unless catastrophic tire failure.
+CRITICAL F1 GAME THEORY (UNDERCUT & CROSSOVER) & STRATEGY RULES:
+- THE UNDERCUT: Pitting earlier than rivals (before tires completely fail) gives you faster fresh tires for a few laps. If the gap to the leader is small and Cliff > 45-55%, boxing EARLY is a powerful attacking move to jump ahead of competitors when they pit later.
+- DO NOT WAIT FOR COMPLETE FAILURE. If wear is rising, you are already losing 1-2 seconds per lap. Waiting until 80%+ cliff means you have already bled 10+ seconds of race time. Pitting earlier is often better to lock in a fast stint on fresh rubber.
+- PIT (BOX) if: (Cliff > 45-55% AND Undercut opportunity exists), OR Cliff Prob > 65% (preventing heavy time loss), OR degradation multiplier > 2.0, OR fuel critical.
+- STAY OUT if: Tire is FRESH (Cliff < 40%) and fuel adequate. Don't waste stops if tires aren't dropping off yet.
+- TIRE AGE MAX: Softs 18 laps, Mediums 28 laps, Hards 40 laps. Aim to pit around 60-75% of max lifespan for optimal pace.
+- Avoid pit stops if only a few laps are remaining in the race.
 
-TIRE COMPOUND LIFETIMES (max safe laps):
-- SOFT: 18 laps (aggressive degradation late-stint)
-- MEDIUM: 28 laps (balanced wear)
-- HARD: 40 laps (conservative degradation)
+EXAMPLES (FEW-SHOT CoT):
+Scenario 1: Laps on Mediums 16/28. Cliff 55%. Pos P2. Gap to Leader: 2.5s. Pit Impact: 24s.
+Reasoning: Tires aren't fully dead, but at 55% cliff they are bleeding time. The gap to the leader is only 2.5s. By pitting NOW for the Undercut, we get 2-3 seconds per lap advantage on fresh tires. When the leader pits in 2 laps, we will have jumped them. Do not wait for complete failure.
+Decision: {"decision": "BOX", "confidence": 0.95, "reasoning": "Cliff is 55% and we are close to the leader. Boxing early for the undercut will provide a massive pace advantage on fresh tires to jump P1.", "tireRecommendation": "HARD"}
 
-TELEMETRY (Lap ${lap}):
+Scenario 2: Laps on Hards 10/40. Cliff 30%. Pos P4. Laps left 20. Pit Impact: 24s.
+Reasoning: Tires are extremely fresh. Pitting now wastes too much race time and sacrifices track position unnecessarily.
+Decision: {"decision": "STAY", "confidence": 0.90, "reasoning": "Tires are very fresh (30% cliff) and well within their lifespan. Staying out to maintain track position and optimal strategy.", "tireRecommendation": "HARD"}
+
+Scenario 3: Laps on Softs 14/18. Cliff 70%. Pos P1. Laps left 15. Pit Impact: 24s.
+Reasoning: Softs are degrading heavily and near max age. We are losing over 1s a lap. Waiting any longer will bleed too much time. Pit now before the time loss exceeds the 24s pit penalty.
+Decision: {"decision": "BOX", "confidence": 0.92, "reasoning": "Soft tires are dying (70% cliff). Pitting to stop the massive time bleed and switch to a more durable compound to finish the race strongly.", "tireRecommendation": "MEDIUM"}
+
+TELEMETRY (Lap ${lap} / 44):
+- Race Progress: ${Math.round((lap / 44) * 100)}% complete (${44 - lap} laps remaining)
 - Current Tires: ${currentTireCompound}
 - Laps on Current Tires: ${lapsSinceLastPit}/${maxLapsForCompound} (${Math.round((lapsSinceLastPit / maxLapsForCompound) * 100)}% of lifespan)
 - Tire Wear Status: ${tireWearStatus}
@@ -393,11 +403,24 @@ STRATEGY ANALYSIS:
 - Total Pit Urgency: ${pitAnalysis.totalUrgency}/10
 - Reasons: ${pitAnalysis.reason.slice(0, 2).join('; ')}`;
 
-        client.chat.complete({
-            model: 'mistral-large-latest',
-            messages: [{ role: 'system', content: prompt }],
-            responseFormat: { type: 'json_object' }
-        }).then(res => {
+        const makeApiRequest = async (retries = 2) => {
+            for (let i = 0; i <= retries; i++) {
+                try {
+                    const res = await client.chat.complete({
+                        model: 'mistral-large-latest',
+                        messages: [{ role: 'system', content: prompt }],
+                        responseFormat: { type: 'json_object' }
+                    });
+                    return res;
+                } catch (err) {
+                    if (i === retries) throw err;
+                    // Wait a moment before retrying if fetch failed
+                    await new Promise(resolve => setTimeout(resolve, 1000));
+                }
+            }
+        };
+
+        makeApiRequest().then(res => {
             try {
                 const responseContent = res.choices[0].message.content;
                 const parsed = JSON.parse(responseContent);
@@ -665,15 +688,15 @@ function startRaceSimulation() {
                     const fuelInfo = fuelStrategy.updateFuelLevel(actualLap, result.x, drivingIntensity);
 
                     // Log to telemetry window with pit stop relevant info
-                    const lapDisplay = `Lap ${lapNumStr}`;
+                    const lapDisplay = `L${lapNumStr}`;
                     const tireDisplay = `${currentTireCompound}(L${lapsSinceLastPit})`;
                     const wearDisplay = `${result.x.toFixed(3)}s`;
-                    const cliffDisplay = `${(result.cliffProb * 100).toFixed(0)}%`;
-                    const fuelDisplay = `${fuelInfo.currentFuel}kg`;
+                    const cliffDisplay = `${(result.cliffProb * 100).toFixed(0)}%`.padStart(4);
 
-                    const paceDisplay = `${(compoundPaceDelta + wearPenalty).toFixed(2)}s/l`;
+                    const currentPaceDelta = baseGapChange + cliffPenalty + tireAdvantage + degradationPenalty;
+                    const paceDisplay = `${currentPaceDelta >= 0 ? '+' : ''}${currentPaceDelta.toFixed(2)}`;
 
-                    telemetryLog.log(`${lapDisplay} | ${tireDisplay.padEnd(12)} | Pace: ${paceDisplay.padStart(6)} | Wear: ${wearDisplay} | Cliff: ${cliffDisplay} | Fuel: ${fuelDisplay}`);
+                    telemetryLog.log(`${lapDisplay} | ${tireDisplay.padEnd(11)} | Pace:${paceDisplay.padStart(6)} | Wear:${wearDisplay} | Cliff:${cliffDisplay}`);
 
                     // Update Chart Data
                     wearSeries.x.push(lapNumStr);
