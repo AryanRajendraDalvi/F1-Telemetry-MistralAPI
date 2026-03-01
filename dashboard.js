@@ -5,6 +5,13 @@ const blessed = require('blessed');
 const contrib = require('blessed-contrib');
 const { Mistral } = require('@mistralai/mistralai');
 
+// Import strategy modules
+const WeatherAnalyzer = require('./weather_analyzer');
+const TireStrategy = require('./tire_strategy');
+const CompetitiveAnalysis = require('./competitive_analysis');
+const FuelStrategy = require('./fuel_strategy');
+const PitStopAnalyzer = require('./pit_stop_analyzer');
+
 // Check Mistral AI Key
 const apiKey = process.env.MISTRAL_API_KEY;
 if (!apiKey) {
@@ -23,6 +30,16 @@ try {
     process.exit(1);
 }
 
+// Randomize starting grid position (P1-P20)
+const startingPosition = Math.floor(Math.random() * 20) + 1;
+
+// Initialize strategy modules
+const weatherAnalyzer = new WeatherAnalyzer();
+const tireStrategy = new TireStrategy('HAM', null, startingPosition); // Random tire + position
+const competitiveAnalysis = new CompetitiveAnalysis();
+const fuelStrategy = new FuelStrategy(110, 44); // 110kg fuel, 44 lap race
+const pitStopAnalyzer = new PitStopAnalyzer(7.0);
+
 // Initial Kalman Filter State
 let state = {
     x: 0.0,
@@ -32,16 +49,27 @@ let state = {
     wear_rate: 0.045
 };
 
-// UI SETUP (Blessed)
+// Simulation state for track and weather conditions
+let raceState = {
+    currentPosition: startingPosition,
+    gapToLeader: startingPosition === 1 ? 0.0 : (startingPosition - 1) * 0.5 + (Math.random() * 2), // Gap increases with position
+    trackTemp: 25,
+    airTemp: 20,
+    humidity: 65,
+    rainfall: 0,
+    enduranceMultiplier: 1.0
+};
+
+// UI SETUP (Blessed) - Enhanced Grid
 const screen = blessed.screen({
     smartCSR: true,
-    title: 'F1 Pit Wall Strategist Dashboard'
+    title: 'F1 Pit Wall Strategist Dashboard - Enhanced'
 });
 
-const grid = new contrib.grid({ rows: 12, cols: 12, screen: screen });
+const grid = new contrib.grid({ rows: 20, cols: 16, screen: screen });
 
 // Window 1 (Left): Raw Telemetry Log
-const telemetryLog = grid.set(0, 0, 12, 6, contrib.log, {
+const telemetryLog = grid.set(0, 0, 10, 8, contrib.log, {
     fg: 'green',
     label: 'Raw Telemetry Stream',
     height: '100%',
@@ -50,7 +78,7 @@ const telemetryLog = grid.set(0, 0, 12, 6, contrib.log, {
 });
 
 // Window 3 (Right Top): Agent Terminal Log
-const agentTerminal = grid.set(0, 6, 6, 6, contrib.log, {
+const agentTerminal = grid.set(0, 8, 5, 8, contrib.log, {
     fg: 'yellow',
     label: 'Agent Terminal (Pit Strategist)',
     height: '100%',
@@ -58,8 +86,26 @@ const agentTerminal = grid.set(0, 6, 6, 6, contrib.log, {
     border: { type: 'line', fg: 'yellow' }
 });
 
-// Window 2 (Right Bottom): Line Chart for Tire Degradation and Cliff Prob
-const lineChart = grid.set(6, 6, 6, 6, contrib.line, {
+// Window 4: Tire Strategy Info
+const strategyBox = grid.set(5, 8, 3, 8, contrib.log, {
+    fg: 'cyan',
+    label: 'Tire Strategy & Stints',
+    height: '100%',
+    width: '100%',
+    border: { type: 'line', fg: 'cyan' }
+});
+
+// Window 5: Weather & Conditions
+const weatherBox = grid.set(8, 8, 2, 8, contrib.log, {
+    fg: 'magenta',
+    label: 'Weather Conditions',
+    height: '100%',
+    width: '100%',
+    border: { type: 'line', fg: 'magenta' }
+});
+
+// Window 2 (Bottom Left): Line Chart for Tire Degradation and Cliff Prob
+const lineChart = grid.set(10, 0, 10, 8, contrib.line, {
     label: 'Tire State vs Laps',
     showLegend: true,
     legend: { width: 14 },
@@ -72,6 +118,24 @@ const lineChart = grid.set(6, 6, 6, 6, contrib.line, {
     xPadding: 5,
     showNumb: true,
     numStyle: 'yellow'
+});
+
+// Window 6: Fuel & Track Position
+const fuelPosBox = grid.set(10, 8, 5, 8, contrib.log, {
+    fg: 'blue',
+    label: 'Fuel & Track Position',
+    height: '100%',
+    width: '100%',
+    border: { type: 'line', fg: 'blue' }
+});
+
+// Window 7: Competitive Analysis
+const compAnalysisBox = grid.set(15, 8, 5, 8, contrib.log, {
+    fg: 'white',
+    label: 'Competitive Analysis',
+    height: '100%',
+    width: '100%',
+    border: { type: 'line', fg: 'white' }
 });
 
 // To view "Wear (s)" and "Cliff Prob %" on the same chart logically,
@@ -105,6 +169,12 @@ let isAgentThinking = false;
 let lastDecisionLap = -5; // prevent immediate double trigger
 let currentLap = 0;
 let executePitStop = false;
+let pitStopCount = 0;
+let currentTireCompound = tireStrategy.currentStint.tireCompound; // Use actual starting compound!
+let previousTireCompound = tireStrategy.currentStint.tireCompound;
+let startingTireCompound = tireStrategy.currentStint.tireCompound;
+let positionBeforePit = 1;
+let lapsSinceLastPit = 0;
 
 function wrapAndLog(terminal, text, maxWidth = 45) {
     if (!text) return;
@@ -124,27 +194,203 @@ function wrapAndLog(terminal, text, maxWidth = 45) {
     }
 }
 
+function updateStrategyDisplay(lap) {
+    const stintInfo = tireStrategy.getStintSummary('current');
+    const allStints = tireStrategy.getAllStintsSummary();
+    
+    strategyBox.setContent('');
+    strategyBox.log(`\x1b[36m=== TIRE STRATEGY ===\x1b[0m`);
+    strategyBox.log(`Strategy: ${tireStrategy.assessStrategy()}`);
+    strategyBox.log(`Total Pit Stops: ${pitStopCount}`);
+    strategyBox.log(``);
+    strategyBox.log(`\x1b[33mCurrent Stint:\x1b[0m`);
+    if (stintInfo) {
+        strategyBox.log(`  Stint #${stintInfo.num} | ${stintInfo.compound}`);
+        strategyBox.log(`  Laps Done: ${stintInfo.laps}`);
+        strategyBox.log(`  Started P${stintInfo.startPos} (${stintInfo.weather})`);
+    }
+    
+    if (allStints.length > 0) {
+        strategyBox.log(``);
+        strategyBox.log(`\x1b[33mPrevious Stints:\x1b[0m`);
+        allStints.forEach(stint => {
+            strategyBox.log(`  S${stint.num}: ${stint.compound} (${stint.laps}L) P${stint.startPos}→P${stint.endPos}`);
+        });
+    }
+}
+
+function updateWeatherDisplay() {
+    weatherBox.setContent('');
+    const weather = weatherAnalyzer.analyzeWeatherImpact(
+        raceState.trackTemp,
+        raceState.airTemp,
+        raceState.humidity,
+        raceState.rainfall
+    );
+    
+    weatherBox.log(`\x1b[35m=== WEATHER CONDITIONS ===\x1b[0m`);
+    weatherBox.log(`${weather.condition} | Grip: ${weather.gripLevel}`);
+    weatherBox.log(`Track: ${weather.trackTemp}°C | Air: ${weather.airTemp}°C | RH: ${weather.humidity}%`);
+    if (weather.riskFactors.length > 0) {
+        weatherBox.log(`⚠️  ${weather.riskFactors.join(', ')}`);
+    }
+}
+
+function updateFuelDisplay(currentLap = 0) {
+    const fuelStatus = fuelStrategy.getFuelStatus();
+    const lapsRemaining = fuelStrategy.getLapsRemaining(currentLap);
+    
+    fuelPosBox.setContent('');
+    fuelPosBox.log(`\x1b[36m=== FUEL & POSITION ===\x1b[0m`);
+    fuelPosBox.log(`Position: P${raceState.currentPosition}`);
+    fuelPosBox.log(`Gap to Leader: ${raceState.gapToLeader.toFixed(3)}s`);
+    fuelPosBox.log(``);
+    fuelPosBox.log(`Fuel: ${fuelStatus.currentFuel}kg (${fuelStatus.percentage}%)`);
+    fuelPosBox.log(`Laps Remaining: ${lapsRemaining}`);
+    
+    if (fuelStatus.critical) {
+        fuelPosBox.log(`\x1b[31m🚨 CRITICAL FUEL\x1b[0m`);
+    } else if (fuelStatus.warning) {
+        fuelPosBox.log(`\x1b[33m⚠️  LOW FUEL\x1b[0m`);
+    }
+}
+
+function updateCompetitiveDisplay() {
+    compAnalysisBox.setContent('');
+    const analysis = competitiveAnalysis.analyzeCompetitiveAdvantage('HAM');
+    
+    compAnalysisBox.log(`\x1b[37m=== COMPETITIVE ANALYSIS ===\x1b[0m`);
+    if (analysis) {
+        compAnalysisBox.log(`Your Position: P${analysis.myPosition}`);
+        compAnalysisBox.log(``);
+        
+        if (analysis.competitorComparison.length > 0) {
+            compAnalysisBox.log(`\x1b[33mNearby Competitors:\x1b[0m`);
+            analysis.competitorComparison.forEach(comp => {
+                const posStr = comp.positionDiff > 0 ? `+${comp.positionDiff}` : `${comp.positionDiff}`;
+                compAnalysisBox.log(`  ${comp.driver}: P${comp.position} (${posStr}) | Stops: ${comp.pitstops}`);
+            });
+        }
+        
+        if (analysis.opportunities.length > 0) {
+            compAnalysisBox.log(``);
+            compAnalysisBox.log(`\x1b[32m✓ Opportunities:\x1b[0m`);
+            analysis.opportunities.slice(0, 2).forEach(opp => compAnalysisBox.log(`  • ${opp}`));
+        }
+        
+        if (analysis.risks.length > 0) {
+            compAnalysisBox.log(``);
+            compAnalysisBox.log(`\x1b[31m✗ Risks:\x1b[0m`);
+            analysis.risks.slice(0, 2).forEach(risk => compAnalysisBox.log(`  • ${risk}`));
+        }
+    }
+}
+
 function handleAiDecision(lap, dropObj, currentP, currentCliff) {
     if (isAgentThinking) return;
 
-    if (currentCliff > 0.70 || (lap > 0 && lap % 5 === 0)) {
+    // ============================================
+    // MANDATORY PIT STOP CHECK - ONLY FOR CRITICAL TIRE FAILURE
+    // ============================================
+    const isMandatoryPit = tireStrategy.isPitStopMandatory(lapsSinceLastPit, currentTireCompound);
+    if (isMandatoryPit) {
+        agentTerminal.log(`\n[Lap ${lap}] 🚨 CRITICAL TIRE FAILURE - Immediate pit required for ${currentTireCompound} (age ${lapsSinceLastPit}/${tireStrategy.getMaxLaps(currentTireCompound)})`);
+        executePitStop = true;
+        positionBeforePit = raceState.currentPosition;
+        return;
+    }
+
+    // ============================================
+    // STANDARD STRATEGY CHECK
+    // ============================================
+
+    // Use pit stop analyzer to determine if pit is strategically needed
+    const pitAnalysis = pitStopAnalyzer.analyzePitStrategy({
+        lap,
+        currentPosition: raceState.currentPosition,
+        gapToLeader: raceState.gapToLeader,
+        cliffProb: currentCliff,
+        fuel: parseFloat(fuelStrategy.getFuelStatus().currentFuel),
+        fuelPerLap: fuelStrategy.getAverageConsumption(),
+        weather: weatherAnalyzer.analyzeWeatherImpact(raceState.trackTemp, raceState.airTemp, raceState.humidity, raceState.rainfall).condition,
+        lapsSincePit: lapsSinceLastPit,
+        tireAge: lapsSinceLastPit,
+        maxTireAge: tireStrategy.getMaxLaps(currentTireCompound)
+    });
+
+    // Only trigger AI decision if pit is strategically important or cliff is critical
+    const shouldDecide = currentCliff > 0.70 || (lap > 0 && lap % 5 === 0) || pitAnalysis.shouldPit;
+
+    if (shouldDecide) {
         if (lap - lastDecisionLap < 2) return;
 
         lastDecisionLap = lap;
         isAgentThinking = true;
-        agentTerminal.log(`\n[Lap ${lap}] 🚨 Critical state detected (Cliff: ${(currentCliff * 100).toFixed(1)}%). Triggering Mistral API...`);
+        agentTerminal.log(`\n[Lap ${lap}] 🚨 Strategy check (Cliff: ${(currentCliff * 100).toFixed(1)}%, Urgency: ${pitAnalysis.totalUrgency}/10)`);
         screen.render();
 
-        const prompt = `You are the lead race strategist for an F1 team. Analyze the following telemetry summary generated by our C++ math engine. Output a short, analytical recommendation (max 3 sentences) on whether we should pit now or stay out, and which tire compound to use next. You must return a valid JSON object with EXACTLY three keys: "decision" (string: "BOX" or "STAY"), "confidence" (number between 0.0 and 1.0), and "reasoning" (string: your explanation).
+        const weatherData = weatherAnalyzer.analyzeWeatherImpact(
+            raceState.trackTemp,
+            raceState.airTemp,
+            raceState.humidity,
+            raceState.rainfall
+        );
 
-CRITICAL STRATEGY RULES:
-- Do NOT PIT (choose 'STAY') if the Cliff Probability is low (under 60%). Tires usually last 15-25 laps; boxing early ruins the race.
-- ONLY choose 'BOX' if Cliff Probability is dangerously high (e.g., > 70%) or if the True Wear indicates a severe loss of grip.
+        const fuelStatus = fuelStrategy.getFuelStatus();
+        const competitive = competitiveAnalysis.analyzeCompetitiveAdvantage('HAM');
+        
+        // Calculate pit stop impact
+        const pitImpact = pitStopAnalyzer.estimatePositionLoss(raceState.currentPosition, lap);
+        const timeLossStr = `${pitImpact.timeLossSeconds}s (~${pitImpact.positionsLost} positions)`;
 
-Telemetry Data:
-- Lap: ${lap}
-- Current True Wear (Smoothed): ${dropObj.toFixed(3)}s
-- Cliff Probability: ${(currentCliff * 100).toFixed(1)}%`;
+        // Get tire wear status
+        const tireWearStatus = tireStrategy.getTireWearStatus(lapsSinceLastPit, currentTireCompound);
+        const maxLapsForCompound = tireStrategy.getMaxLaps(currentTireCompound);
+        const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
+
+        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to pit now or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
+
+CRITICAL RULES:
+- PODIUM PROTECTION: If in P1-P3, ONLY pit if Cliff > 85% AND more than 10 laps remaining. Podium > everything else.
+- PIT (BOX) if: (Cliff Prob > 75% AND not podium) OR Fuel < 10 laps, OR degradation multiplier > 3.0, OR strategic advantage clear
+- STAY OUT if: Tire is FRESH/NORMAL, Cliff < 65%, fuel adequate - early pits waste races. ESPECIALLY if in podium position.
+- TIRE AGE: Each compound has realistic lifespan. Softs degrade fastest (18 laps max), Hards last longest (40 laps max)
+- Each pit stop costs ${timeLossStr} - must be justified. AVOID if in podium unless catastrophic tire failure.
+
+TIRE COMPOUND LIFETIMES (max safe laps):
+- SOFT: 18 laps (aggressive degradation late-stint)
+- MEDIUM: 28 laps (balanced wear)
+- HARD: 40 laps (conservative degradation)
+
+TELEMETRY (Lap ${lap}):
+- Current Tires: ${currentTireCompound}
+- Laps on Current Tires: ${lapsSinceLastPit}/${maxLapsForCompound} (${Math.round((lapsSinceLastPit/maxLapsForCompound)*100)}% of lifespan)
+- Tire Wear Status: ${tireWearStatus}
+- Degradation Curve Multiplier: ${degradationMultiplier.toFixed(2)}x (1.0=normal, 4.0+=critical cliff)
+- Cliff Probability: ${(currentCliff * 100).toFixed(1)}% (CRITICAL if >75%)
+- True Tire Wear: ${dropObj.toFixed(3)}s
+- Pit Stops Made: ${pitStopCount}
+
+POSITION & GAP:
+- Current Position: P${raceState.currentPosition} ${raceState.currentPosition <= 3 ? '🏆 PODIUM POSITION - PROTECT!' : ''}
+- Gap to Leader: ${raceState.gapToLeader.toFixed(3)}s
+- PIT IMPACT: Lose ${timeLossStr} → P${pitImpact.newPosition}
+
+FUEL SITUATION:
+- Fuel: ${fuelStatus.currentFuel}kg (${fuelStatus.percentage}%)
+- Laps Remaining: ${fuelStrategy.getLapsRemaining(lap)}
+- Avg Consumption: ${fuelStatus.avgConsumption}kg/lap
+${fuelStatus.critical ? '⚠️  CRITICAL LOW FUEL' : fuelStatus.warning ? '⚠️  LOW FUEL' : '✓ Fuel OK'}
+
+WEATHER:
+- Current: ${weatherData.condition}
+- Grip: ${weatherData.gripLevel}
+- Recommended Compound: ${weatherData.recommendedTireCompound}
+${weatherData.riskFactors.length > 0 ? '- Risks: ' + weatherData.riskFactors.join(', ') : ''}
+
+STRATEGY ANALYSIS:
+- Total Pit Urgency: ${pitAnalysis.totalUrgency}/10
+- Reasons: ${pitAnalysis.reason.slice(0, 2).join('; ')}`;
 
         client.chat.complete({
             model: 'mistral-large-latest',
@@ -155,39 +401,45 @@ Telemetry Data:
                 const responseContent = res.choices[0].message.content;
                 const parsed = JSON.parse(responseContent);
                 const reasoning = parsed.reasoning || parsed.Reasoning || "No reasoning provided by agent.";
-                agentTerminal.log(``); // padding line
-                agentTerminal.log(`\x1b[4m>>> STRATEGY (Lap ${lap}) <<<\x1b[0m`);
-                agentTerminal.log(`Cliff Check: ${(currentCliff * 100).toFixed(1)}%`);
+                const tireRec = parsed.tireRecommendation || 'MEDIUM';
+                
+                agentTerminal.log(``);
+                agentTerminal.log(`\x1b[4m>>> STRATEGY DECISION (Lap ${lap}) <<<\x1b[0m`);
+                agentTerminal.log(`Urgency: ${pitAnalysis.totalUrgency}/10 | Cliff: ${(currentCliff * 100).toFixed(1)}%`);
                 agentTerminal.log(`Decision:   \x1b[35m${parsed.decision}\x1b[0m`);
                 agentTerminal.log(`Confidence: \x1b[36m${(parsed.confidence * 100).toFixed(1)}%\x1b[0m`);
+                agentTerminal.log(`Pit Impact: ${timeLossStr}`);
+                agentTerminal.log(`Tire Choice: ${tireRec}`);
                 agentTerminal.log(`Reasoning:`);
                 wrapAndLog(agentTerminal, reasoning, 45);
                 agentTerminal.log(`-----------------------------`);
 
-                if (parsed.decision === 'BOX') {
+                if (parsed.decision === 'BOX' && pitAnalysis.totalUrgency > 3) {
                     executePitStop = true;
+                    positionBeforePit = raceState.currentPosition;
+                } else if (parsed.decision === 'BOX' && pitAnalysis.totalUrgency <= 3) {
+                    agentTerminal.log(`⚠️  BOX recommended but urgency low - analyzing...`);
                 }
             } catch (err) {
-                // In case the API returns JSON with some surrounding markdown
                 try {
                     const extractJson = responseContent.match(/\{[\s\S]*\}/)[0];
                     const parsedFallback = JSON.parse(extractJson);
-                    const reasoningFallback = parsedFallback.reasoning || parsedFallback.Reasoning || "No reasoning provided by agent.";
-                    agentTerminal.log(``); // padding line
-                    agentTerminal.log(`\x1b[4m>>> STRATEGY (Lap ${lap}) <<<\x1b[0m`);
-                    agentTerminal.log(`Cliff Check: ${(currentCliff * 100).toFixed(1)}%`);
+                    const reasoningFallback = parsedFallback.reasoning || "No reasoning";
+                    
+                    agentTerminal.log(``);
+                    agentTerminal.log(`\x1b[4m>>> STRATEGY DECISION (Lap ${lap}) <<<\x1b[0m`);
                     agentTerminal.log(`Decision:   \x1b[35m${parsedFallback.decision}\x1b[0m`);
                     agentTerminal.log(`Confidence: \x1b[36m${(parsedFallback.confidence * 100).toFixed(1)}%\x1b[0m`);
                     agentTerminal.log(`Reasoning:`);
                     wrapAndLog(agentTerminal, reasoningFallback, 45);
                     agentTerminal.log(`-----------------------------`);
 
-                    if (parsedFallback.decision === 'BOX') {
+                    if (parsedFallback.decision === 'BOX' && pitAnalysis.totalUrgency > 3) {
                         executePitStop = true;
+                        positionBeforePit = raceState.currentPosition;
                     }
                 } catch (fallbackErr) {
                     agentTerminal.log(`[Error parsing API response]: ${err.message}`);
-                    agentTerminal.log(`Raw Response: ${responseContent}`);
                 }
             }
             screen.render();
@@ -213,12 +465,16 @@ function startRaceSimulation() {
         .on('data', (row) => telemetryStream.push(row))
         .on('end', () => {
             telemetryLog.log('--- Telemetry Loaded. Starting Live Race Simulation ---');
+            telemetryLog.log(`Starting Position: P${startingPosition}`);
+            telemetryLog.log(`Starting Tire Compound: ${startingTireCompound}`);
             screen.render();
 
             const interval = setInterval(() => {
                 if (currentLap >= telemetryStream.length) {
                     clearInterval(interval);
                     telemetryLog.log('--- Race Finished ---');
+                    telemetryLog.log(`Final Pit Stops: ${pitStopCount}`);
+                    telemetryLog.log(`Final Position: P${raceState.currentPosition}`);
                     telemetryLog.log('Press [ESC], [Q], or [CTRL-C] to exit.');
                     screen.render();
                     return;
@@ -229,27 +485,136 @@ function startRaceSimulation() {
                 const lapNumStr = actualLap.toString().padStart(2, '0');
                 const degradationDelta = parseFloat(rawData.Degradation_Delta);
 
+                // Simulate dynamic weather (changes every 5 laps)
+                if (actualLap % 5 === 1) {
+                    raceState.trackTemp = 20 + Math.random() * 40;
+                    raceState.airTemp = 15 + Math.random() * 25;
+                    raceState.humidity = 40 + Math.random() * 60;
+                    // Only 15% chance of rain (less aggressive than before)
+                    raceState.rainfall = Math.random() < 0.15 ? Math.random() * 3 : 0;
+                }
+
+                // Simulate position changes (±1 position randomly)
+                if (Math.random() < 0.1) {
+                    const posChange = Math.random() < 0.5 ? -1 : 1;
+                    raceState.currentPosition = Math.max(1, Math.min(20, raceState.currentPosition + posChange));
+                }
+
+                // Simulate gap development
+                raceState.gapToLeader += (Math.random() - 0.4) * 0.3;
+                raceState.gapToLeader = Math.max(0, raceState.gapToLeader);
+
+                // Update tire strategy info
+                tireStrategy.updateCurrentStint(actualLap, state.x, raceState.currentPosition, `${raceState.trackTemp.toFixed(0)}°C`);
+                lapsSinceLastPit++;
+
+                // Handle pit stop and tire change
                 if (executePitStop) {
-                    // Pit stop commanded by Agent, reset tire degradation state
+                    pitStopCount++;
+                    positionBeforePit = raceState.currentPosition;
+                    previousTireCompound = currentTireCompound; // Save what we're coming off
+                    
+                    // Calculate realistic position change from pit stop
+                    const pitImpact = pitStopAnalyzer.estimatePositionLoss(raceState.currentPosition, actualLap);
+                    const newPosition = pitImpact.newPosition;
+                    
+                    // Intelligently choose next tire compound based on weather
+                    const weather = weatherAnalyzer.analyzeWeatherImpact(
+                        raceState.trackTemp, raceState.airTemp, raceState.humidity, raceState.rainfall
+                    );
+                    
+                    const tireChoices = {
+                        'DRY': ['MEDIUM', 'HARD', 'SOFT'],
+                        'INTERMEDIATE': ['INTERMEDIATE'],
+                        'WET': ['WET', 'INTERMEDIATE'],
+                        'EXTREME_WET': ['EXTREME_WET']
+                    };
+                    
+                    // Select new compound intelligently
+                    let availableCompounds = tireChoices[weather.condition] || ['MEDIUM'];
+                    
+                    // If previous stint was SOFT, prefer harder compounds next
+                    if (previousTireCompound === 'SOFT' && weather.condition === 'DRY') {
+                        availableCompounds = ['MEDIUM', 'HARD']; // Harder after SOFT
+                    } else if (previousTireCompound === 'HARD' && weather.condition === 'DRY' && lapsSinceLastPit > 25) {
+                        availableCompounds = ['SOFT', 'MEDIUM']; // Softer for grip if stint was long
+                    }
+                    
+                    // CRITICAL: Never pick the same compound (no point in changing tires to same compound)
+                    availableCompounds = availableCompounds.filter(c => c !== previousTireCompound);
+                    // If all options filtered out, fall back to preferred options excluding previous
+                    if (availableCompounds.length === 0) {
+                        availableCompounds = tireChoices[weather.condition].filter(c => c !== previousTireCompound) || ['HARD'];
+                    }
+                    
+                    const newCompound = availableCompounds[Math.floor(Math.random() * availableCompounds.length)];
+                    
+                    // Record pit and update tire strategy
+                    tireStrategy.pitAndChangeCompound(
+                        actualLap, 
+                        newCompound, 
+                        newPosition,
+                        state.x,
+                        weather.condition
+                    );
+                    
+                    // Update position to post-pit position
+                    raceState.currentPosition = newPosition;
+                    
+                    // Reset tire degradation state after pit
                     state.x = 0.0;
                     state.P = 1.0;
+                    
+                    // Update tire compound AFTER logging previous one
+                    currentTireCompound = newCompound;
+                    
+                    // Reset laps counter for new stint
+                    lapsSinceLastPit = 0;
+                    
+                    // Log pit stop with detailed analysis - showing ACTUAL tire change
                     telemetryLog.log('');
-                    telemetryLog.log(`\x1b[33m--- PIT STOP: Tires Changed (Agent Decision) ---\x1b[0m`);
+                    telemetryLog.log(`\x1b[33m╔════════════════════════════════════════╗\x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║   PIT STOP #${pitStopCount} (Lap ${actualLap})                    ║\x1b[0m`);
+                    telemetryLog.log(`\x1b[33m╠════════════════════════════════════════╣\x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║ Position: P${positionBeforePit} → P${newPosition} (-${pitImpact.positionsLost} pos)  \x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║ Time Loss: ${pitImpact.timeLossSeconds}s                    \x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║ Tires: ${previousTireCompound.padEnd(8)} → ${newCompound.padEnd(8)}        \x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║ Weather: ${weather.condition.padEnd(12)} (${weather.gripLevel})   \x1b[0m`);
+                    telemetryLog.log(`\x1b[33m║ Rainfall: ${weather.rainfall}mm                    \x1b[0m`);
+                    telemetryLog.log(`\x1b[33m╚════════════════════════════════════════╝\x1b[0m`);
                     telemetryLog.log('');
+
+                    
                     executePitStop = false;
                 }
 
+                // Process Kalman filter with degradation
                 if (!isNaN(degradationDelta)) {
-                    // C++ Update
+                    // Apply tire age degradation multiplier
+                    // Tires degrade faster as they age (cliff effect)
+                    const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
+                    const adjustedDegradationDelta = degradationDelta * degradationMultiplier;
+                    
+                    // C++ Update with age-adjusted degradation
                     const result = kalmanMath.updateState(
-                        state.x, state.P, state.Q, state.R, state.wear_rate, degradationDelta
+                        state.x, state.P, state.Q, state.R, state.wear_rate, adjustedDegradationDelta
                     );
 
                     state.x = result.x;
                     state.P = result.P;
 
-                    // Log to Windows 1
-                    telemetryLog.log(`Lap ${lapNumStr} | Raw Drop: ${degradationDelta.toFixed(3)}s | True Wear: ${result.x.toFixed(3)}s | Cliff: ${(result.cliffProb * 100).toFixed(1)}%`);
+                    // Simulate driving intensity and fuel consumption
+                    const drivingIntensity = result.cliffProb > 0.5 ? 'AGGRESSIVE' : 'NORMAL';
+                    const fuelInfo = fuelStrategy.updateFuelLevel(actualLap, result.x, drivingIntensity);
+
+                    // Log to telemetry window with pit stop relevant info
+                    const lapDisplay = `Lap ${lapNumStr}`;
+                    const tireDisplay = `${currentTireCompound}(L${lapsSinceLastPit})`;
+                    const wearDisplay = `${result.x.toFixed(3)}s`;
+                    const cliffDisplay = `${(result.cliffProb * 100).toFixed(0)}%`;
+                    const fuelDisplay = `${fuelInfo.currentFuel}kg`;
+                    
+                    telemetryLog.log(`${lapDisplay} | ${tireDisplay.padEnd(12)} | Wear: ${wearDisplay} | Cliff: ${cliffDisplay} | Fuel: ${fuelDisplay}`);
 
                     // Update Chart Data
                     wearSeries.x.push(lapNumStr);
@@ -267,8 +632,17 @@ function startRaceSimulation() {
 
                     lineChart.setData([wearSeries, cliffSeries]);
 
-                    // Trigger AI
+                    // Trigger AI decision
                     handleAiDecision(actualLap, result.x, result.P, result.cliffProb);
+
+                    // Update all info displays
+                    updateStrategyDisplay(actualLap);
+                    updateWeatherDisplay();
+                    updateFuelDisplay(actualLap);
+                    updateCompetitiveDisplay();
+
+                    // Update competitors
+                    competitiveAnalysis.updateCompetitor('HAM', raceState.currentPosition, actualLap, currentTireCompound);
 
                     screen.render();
                 }
