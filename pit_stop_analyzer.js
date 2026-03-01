@@ -28,21 +28,29 @@ class PitStopAnalyzer {
     // Later in race = positions compressed = less position loss
     const raceProgress = lap / raceLength;
     const spreadFactor = 1 - (raceProgress * 0.5); // 100% early, 50% late
-    
+
     // Calculate time loss to positions lost conversion
     const timeLossSeconds = this.pitStopDuration;
     const avgLapSeconds = this.avgLapTime;
-    
+
     // Every ~2-3 seconds of time loss = 1 position loss
     let positionsLost = Math.ceil(timeLossSeconds / (avgLapSeconds * 0.15)) * spreadFactor;
-    
+
     // Cap based on position (can't lose more positions than behind you)
-    positionsLost = Math.max(1, Math.min(positionsLost, currentPosition - 1));
-    
-    // Add variance (±0.5 positions)
-    const variance = (Math.random() - 0.5) * 1;
-    positionsLost = Math.max(1, positionsLost + variance);
-    
+    positionsLost = Math.max(0, Math.min(positionsLost, currentPosition - 1));
+
+    // 40% chance of a "free pit stop" (e.g., maintaining position due to large gap behind)
+    if (Math.random() < 0.4) {
+      positionsLost = 0;
+    } else {
+      // Add variance (±1 positions)
+      const variance = Math.round((Math.random() - 0.5) * 2);
+      positionsLost = Math.max(0, positionsLost + variance);
+    }
+
+    // Make sure we don't go below position 1 or positive positionsLost
+    positionsLost = Math.max(0, positionsLost);
+
     return {
       timeLossSeconds: timeLossSeconds,
       positionsLost: Math.round(positionsLost),
@@ -59,17 +67,17 @@ class PitStopAnalyzer {
     // Fresh tires are typically 0.5-1.0s faster per lap than worn tires
     const tireAdvantagePerLap = 0.7; // seconds/lap
     const avgLapTime = this.avgLapTime;
-    
+
     // Maximum positions that can be gained
     const maxGainPerLap = (tireAdvantagePerLap / avgLapTime) * 20; // scale to position changes
-    
+
     // Can only gain on cars ahead
     const availablePositionsToGain = currentPosition - 1;
     const positionGain = Math.min(
       maxGainPerLap * lapsAfterPit,
       availablePositionsToGain
     );
-    
+
     return {
       lapsAnalyzed: lapsAfterPit,
       estimatedPositionGain: positionGain,
@@ -85,7 +93,7 @@ class PitStopAnalyzer {
   determineOptimalPitWindow(currentLap, currentCliffProb, lapsSinceLastPit, tireAge = 0, maxTireAge = 25) {
     const criticalCliff = 0.75;
     const warningCliff = 0.65;
-    
+
     // TIRE AGE CRITICAL: If near end of tire life, pit immediately
     if (tireAge >= maxTireAge * 0.95) {
       return {
@@ -95,7 +103,7 @@ class PitStopAnalyzer {
         reason: 'Tire age at critical limit - immediate pit required'
       };
     }
-    
+
     // Already at critical level = PIT NOW
     if (currentCliffProb >= criticalCliff) {
       return {
@@ -105,7 +113,7 @@ class PitStopAnalyzer {
         reason: 'Tires at critical degradation level'
       };
     }
-    
+
     // At warning level = pit within 2 laps
     if (currentCliffProb >= warningCliff) {
       return {
@@ -115,7 +123,7 @@ class PitStopAnalyzer {
         reason: 'Tires approaching cliff, pit in next lap'
       };
     }
-    
+
     // Safe zone but track usage
     if (lapsSinceLastPit > 20 && currentCliffProb > 0.50) {
       return {
@@ -125,7 +133,7 @@ class PitStopAnalyzer {
         reason: 'Tires degrading, consider strategic pit'
       };
     }
-    
+
     // Fresh tires, stay out
     return {
       recommendation: 'STAY_OUT',
@@ -152,7 +160,7 @@ class PitStopAnalyzer {
       tireAge = 0,        // New: current tire age in laps
       maxTireAge = 25     // New: max lifespan for current compound
     } = currentState;
-    
+
     const analysis = {
       shouldPit: false,
       reason: [],
@@ -160,7 +168,7 @@ class PitStopAnalyzer {
       fuelUrgency: 0,
       strategyUrgency: 0
     };
-    
+
     // TIRE AGE URGENCY (0-10) - NEW CRITICAL FACTOR
     const tireAgePercent = tireAge / maxTireAge;
     if (tireAgePercent >= 0.95) {
@@ -180,7 +188,7 @@ class PitStopAnalyzer {
     } else {
       analysis.tireUrgency = Math.round(cliffProb * 5); // Scale cliff prob to 0-5 range when tires fresh
     }
-    
+
     // CLIFF PROBABILITY URGENCY (0-10)
     if (cliffProb > 0.75) {
       analysis.tireUrgency = Math.max(analysis.tireUrgency, 10);
@@ -193,7 +201,7 @@ class PitStopAnalyzer {
       analysis.tireUrgency = Math.max(analysis.tireUrgency, 4);
       analysis.reason.push('MEDIUM: Tires wearing');
     }
-    
+
     // FUEL URGENCY (0-10)
     const lapsRemaining = Math.ceil(fuel / fuelPerLap);
     if (lapsRemaining < 5) {
@@ -206,7 +214,7 @@ class PitStopAnalyzer {
     } else {
       analysis.fuelUrgency = 1;
     }
-    
+
     // STRATEGY URGENCY (0-10) based on position
     if (currentPosition > 10 && cliffProb > 0.50 && lapsSincePit > 15) {
       analysis.strategyUrgency = 6;
@@ -217,10 +225,10 @@ class PitStopAnalyzer {
     } else {
       analysis.strategyUrgency = 1;
     }
-    
+
     // Combined urgency - weighted more toward tire age now
     const totalUrgency = (analysis.tireUrgency * 1.5 + analysis.fuelUrgency + analysis.strategyUrgency) / 3.5;
-    
+
     return {
       ...analysis,
       totalUrgency: Math.round(totalUrgency),

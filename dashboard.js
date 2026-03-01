@@ -197,7 +197,7 @@ function wrapAndLog(terminal, text, maxWidth = 45) {
 function updateStrategyDisplay(lap) {
     const stintInfo = tireStrategy.getStintSummary('current');
     const allStints = tireStrategy.getAllStintsSummary();
-    
+
     strategyBox.setContent('');
     strategyBox.log(`\x1b[36m=== TIRE STRATEGY ===\x1b[0m`);
     strategyBox.log(`Strategy: ${tireStrategy.assessStrategy()}`);
@@ -209,7 +209,7 @@ function updateStrategyDisplay(lap) {
         strategyBox.log(`  Laps Done: ${stintInfo.laps}`);
         strategyBox.log(`  Started P${stintInfo.startPos} (${stintInfo.weather})`);
     }
-    
+
     if (allStints.length > 0) {
         strategyBox.log(``);
         strategyBox.log(`\x1b[33mPrevious Stints:\x1b[0m`);
@@ -227,7 +227,7 @@ function updateWeatherDisplay() {
         raceState.humidity,
         raceState.rainfall
     );
-    
+
     weatherBox.log(`\x1b[35m=== WEATHER CONDITIONS ===\x1b[0m`);
     weatherBox.log(`${weather.condition} | Grip: ${weather.gripLevel}`);
     weatherBox.log(`Track: ${weather.trackTemp}°C | Air: ${weather.airTemp}°C | RH: ${weather.humidity}%`);
@@ -239,7 +239,7 @@ function updateWeatherDisplay() {
 function updateFuelDisplay(currentLap = 0) {
     const fuelStatus = fuelStrategy.getFuelStatus();
     const lapsRemaining = fuelStrategy.getLapsRemaining(currentLap);
-    
+
     fuelPosBox.setContent('');
     fuelPosBox.log(`\x1b[36m=== FUEL & POSITION ===\x1b[0m`);
     fuelPosBox.log(`Position: P${raceState.currentPosition}`);
@@ -247,7 +247,7 @@ function updateFuelDisplay(currentLap = 0) {
     fuelPosBox.log(``);
     fuelPosBox.log(`Fuel: ${fuelStatus.currentFuel}kg (${fuelStatus.percentage}%)`);
     fuelPosBox.log(`Laps Remaining: ${lapsRemaining}`);
-    
+
     if (fuelStatus.critical) {
         fuelPosBox.log(`\x1b[31m🚨 CRITICAL FUEL\x1b[0m`);
     } else if (fuelStatus.warning) {
@@ -258,12 +258,12 @@ function updateFuelDisplay(currentLap = 0) {
 function updateCompetitiveDisplay() {
     compAnalysisBox.setContent('');
     const analysis = competitiveAnalysis.analyzeCompetitiveAdvantage('HAM');
-    
+
     compAnalysisBox.log(`\x1b[37m=== COMPETITIVE ANALYSIS ===\x1b[0m`);
     if (analysis) {
         compAnalysisBox.log(`Your Position: P${analysis.myPosition}`);
         compAnalysisBox.log(``);
-        
+
         if (analysis.competitorComparison.length > 0) {
             compAnalysisBox.log(`\x1b[33mNearby Competitors:\x1b[0m`);
             analysis.competitorComparison.forEach(comp => {
@@ -271,13 +271,13 @@ function updateCompetitiveDisplay() {
                 compAnalysisBox.log(`  ${comp.driver}: P${comp.position} (${posStr}) | Stops: ${comp.pitstops}`);
             });
         }
-        
+
         if (analysis.opportunities.length > 0) {
             compAnalysisBox.log(``);
             compAnalysisBox.log(`\x1b[32m✓ Opportunities:\x1b[0m`);
             analysis.opportunities.slice(0, 2).forEach(opp => compAnalysisBox.log(`  • ${opp}`));
         }
-        
+
         if (analysis.risks.length > 0) {
             compAnalysisBox.log(``);
             compAnalysisBox.log(`\x1b[31m✗ Risks:\x1b[0m`);
@@ -319,7 +319,7 @@ function handleAiDecision(lap, dropObj, currentP, currentCliff) {
     });
 
     // Only trigger AI decision if pit is strategically important or cliff is critical
-    const shouldDecide = currentCliff > 0.70 || (lap > 0 && lap % 5 === 0) || pitAnalysis.shouldPit;
+    const shouldDecide = currentCliff > 0.40 || (lap > 0 && lap % 4 === 0) || pitAnalysis.shouldPit;
 
     if (shouldDecide) {
         if (lap - lastDecisionLap < 2) return;
@@ -338,7 +338,7 @@ function handleAiDecision(lap, dropObj, currentP, currentCliff) {
 
         const fuelStatus = fuelStrategy.getFuelStatus();
         const competitive = competitiveAnalysis.analyzeCompetitiveAdvantage('HAM');
-        
+
         // Calculate pit stop impact
         const pitImpact = pitStopAnalyzer.estimatePositionLoss(raceState.currentPosition, lap);
         const timeLossStr = `${pitImpact.timeLossSeconds}s (~${pitImpact.positionsLost} positions)`;
@@ -348,23 +348,31 @@ function handleAiDecision(lap, dropObj, currentP, currentCliff) {
         const maxLapsForCompound = tireStrategy.getMaxLaps(currentTireCompound);
         const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
 
-        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to pit now or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
+        const prompt = `You are the lead race strategist for F1 Hamilton's team. Analyze race data and decide whether to box or stay out. Return JSON: {"decision": "BOX" or "STAY", "confidence": 0.0-1.0, "reasoning": "explanation", "tireRecommendation": "SOFT/MEDIUM/HARD/WET"}.
 
-CRITICAL RULES:
-- PODIUM PROTECTION: If in P1-P3, ONLY pit if Cliff > 85% AND more than 10 laps remaining. Podium > everything else.
-- PIT (BOX) if: (Cliff Prob > 75% AND not podium) OR Fuel < 10 laps, OR degradation multiplier > 3.0, OR strategic advantage clear
-- STAY OUT if: Tire is FRESH/NORMAL, Cliff < 65%, fuel adequate - early pits waste races. ESPECIALLY if in podium position.
-- TIRE AGE: Each compound has realistic lifespan. Softs degrade fastest (18 laps max), Hards last longest (40 laps max)
-- Each pit stop costs ${timeLossStr} - must be justified. AVOID if in podium unless catastrophic tire failure.
+CRITICAL F1 GAME THEORY (UNDERCUT & CROSSOVER) & STRATEGY RULES:
+- THE UNDERCUT: Pitting earlier than rivals (before tires completely fail) gives you faster fresh tires for a few laps. If the gap to the leader is small and Cliff > 45-55%, boxing EARLY is a powerful attacking move to jump ahead of competitors when they pit later.
+- DO NOT WAIT FOR COMPLETE FAILURE. If wear is rising, you are already losing 1-2 seconds per lap. Waiting until 80%+ cliff means you have already bled 10+ seconds of race time. Pitting earlier is often better to lock in a fast stint on fresh rubber.
+- PIT (BOX) if: (Cliff > 45-55% AND Undercut opportunity exists), OR Cliff Prob > 65% (preventing heavy time loss), OR degradation multiplier > 2.0, OR fuel critical.
+- STAY OUT if: Tire is FRESH (Cliff < 40%) and fuel adequate. Don't waste stops if tires aren't dropping off yet.
+- TIRE AGE MAX: Softs 18 laps, Mediums 28 laps, Hards 40 laps. Aim to pit around 60-75% of max lifespan for optimal pace.
 
-TIRE COMPOUND LIFETIMES (max safe laps):
-- SOFT: 18 laps (aggressive degradation late-stint)
-- MEDIUM: 28 laps (balanced wear)
-- HARD: 40 laps (conservative degradation)
+EXAMPLES (FEW-SHOT CoT):
+Scenario 1: Laps on Mediums 16/28. Cliff 55%. Pos P2. Gap to Leader: 2.5s. Pit Impact: 24s.
+Reasoning: Tires aren't fully dead, but at 55% cliff they are bleeding time. The gap to the leader is only 2.5s. By pitting NOW for the Undercut, we get 2-3 seconds per lap advantage on fresh tires. When the leader pits in 2 laps, we will have jumped them. Do not wait for complete failure.
+Decision: {"decision": "BOX", "confidence": 0.95, "reasoning": "Cliff is 55% and we are close to the leader. Boxing early for the undercut will provide a massive pace advantage on fresh tires to jump P1.", "tireRecommendation": "HARD"}
+
+Scenario 2: Laps on Hards 10/40. Cliff 30%. Pos P4. Laps left 20. Pit Impact: 24s.
+Reasoning: Tires are extremely fresh. Pitting now wastes too much race time and sacrifices track position unnecessarily.
+Decision: {"decision": "STAY", "confidence": 0.90, "reasoning": "Tires are very fresh (30% cliff) and well within their lifespan. Staying out to maintain track position and optimal strategy.", "tireRecommendation": "HARD"}
+
+Scenario 3: Laps on Softs 14/18. Cliff 70%. Pos P1. Laps left 15. Pit Impact: 24s.
+Reasoning: Softs are degrading heavily and near max age. We are losing over 1s a lap. Waiting any longer will bleed too much time. Pit now before the time loss exceeds the 24s pit penalty.
+Decision: {"decision": "BOX", "confidence": 0.92, "reasoning": "Soft tires are dying (70% cliff). Pitting to stop the massive time bleed and switch to a more durable compound to finish the race strongly.", "tireRecommendation": "MEDIUM"}
 
 TELEMETRY (Lap ${lap}):
 - Current Tires: ${currentTireCompound}
-- Laps on Current Tires: ${lapsSinceLastPit}/${maxLapsForCompound} (${Math.round((lapsSinceLastPit/maxLapsForCompound)*100)}% of lifespan)
+- Laps on Current Tires: ${lapsSinceLastPit}/${maxLapsForCompound} (${Math.round((lapsSinceLastPit / maxLapsForCompound) * 100)}% of lifespan)
 - Tire Wear Status: ${tireWearStatus}
 - Degradation Curve Multiplier: ${degradationMultiplier.toFixed(2)}x (1.0=normal, 4.0+=critical cliff)
 - Cliff Probability: ${(currentCliff * 100).toFixed(1)}% (CRITICAL if >75%)
@@ -372,7 +380,7 @@ TELEMETRY (Lap ${lap}):
 - Pit Stops Made: ${pitStopCount}
 
 POSITION & GAP:
-- Current Position: P${raceState.currentPosition} ${raceState.currentPosition <= 3 ? '🏆 PODIUM POSITION - PROTECT!' : ''}
+- Current Position: P${raceState.currentPosition} ${raceState.currentPosition <= 3 ? '🏆 PODIUM POSITION' : ''}
 - Gap to Leader: ${raceState.gapToLeader.toFixed(3)}s
 - PIT IMPACT: Lose ${timeLossStr} → P${pitImpact.newPosition}
 
@@ -402,7 +410,7 @@ STRATEGY ANALYSIS:
                 const parsed = JSON.parse(responseContent);
                 const reasoning = parsed.reasoning || parsed.Reasoning || "No reasoning provided by agent.";
                 const tireRec = parsed.tireRecommendation || 'MEDIUM';
-                
+
                 agentTerminal.log(``);
                 agentTerminal.log(`\x1b[4m>>> STRATEGY DECISION (Lap ${lap}) <<<\x1b[0m`);
                 agentTerminal.log(`Urgency: ${pitAnalysis.totalUrgency}/10 | Cliff: ${(currentCliff * 100).toFixed(1)}%`);
@@ -425,7 +433,7 @@ STRATEGY ANALYSIS:
                     const extractJson = responseContent.match(/\{[\s\S]*\}/)[0];
                     const parsedFallback = JSON.parse(extractJson);
                     const reasoningFallback = parsedFallback.reasoning || "No reasoning";
-                    
+
                     agentTerminal.log(``);
                     agentTerminal.log(`\x1b[4m>>> STRATEGY DECISION (Lap ${lap}) <<<\x1b[0m`);
                     agentTerminal.log(`Decision:   \x1b[35m${parsedFallback.decision}\x1b[0m`);
@@ -437,6 +445,8 @@ STRATEGY ANALYSIS:
                     if (parsedFallback.decision === 'BOX' && pitAnalysis.totalUrgency > 3) {
                         executePitStop = true;
                         positionBeforePit = raceState.currentPosition;
+                    } else if (parsedFallback.decision === 'BOX' && pitAnalysis.totalUrgency <= 3) {
+                        agentTerminal.log(`⚠️  BOX recommended but urgency low - analyzing...`);
                     }
                 } catch (fallbackErr) {
                     agentTerminal.log(`[Error parsing API response]: ${err.message}`);
@@ -500,8 +510,11 @@ function startRaceSimulation() {
                     raceState.currentPosition = Math.max(1, Math.min(20, raceState.currentPosition + posChange));
                 }
 
-                // Simulate gap development
-                raceState.gapToLeader += (Math.random() - 0.4) * 0.3;
+                // Simulate gap development (incorporating specific tire compound pace advantage)
+                const baselineGapVars = (Math.random() - 0.4) * 0.3;
+                const compoundPaceDelta = tireStrategy.getCompoundPaceAdvantage(currentTireCompound);
+                const wearPenalty = (state.x * 2.5); // Add pace penalty for degraded rubber
+                raceState.gapToLeader += baselineGapVars + compoundPaceDelta + wearPenalty;
                 raceState.gapToLeader = Math.max(0, raceState.gapToLeader);
 
                 // Update tire strategy info
@@ -513,64 +526,64 @@ function startRaceSimulation() {
                     pitStopCount++;
                     positionBeforePit = raceState.currentPosition;
                     previousTireCompound = currentTireCompound; // Save what we're coming off
-                    
+
                     // Calculate realistic position change from pit stop
                     const pitImpact = pitStopAnalyzer.estimatePositionLoss(raceState.currentPosition, actualLap);
                     const newPosition = pitImpact.newPosition;
-                    
+
                     // Intelligently choose next tire compound based on weather
                     const weather = weatherAnalyzer.analyzeWeatherImpact(
                         raceState.trackTemp, raceState.airTemp, raceState.humidity, raceState.rainfall
                     );
-                    
+
                     const tireChoices = {
                         'DRY': ['MEDIUM', 'HARD', 'SOFT'],
                         'INTERMEDIATE': ['INTERMEDIATE'],
                         'WET': ['WET', 'INTERMEDIATE'],
                         'EXTREME_WET': ['EXTREME_WET']
                     };
-                    
+
                     // Select new compound intelligently
                     let availableCompounds = tireChoices[weather.condition] || ['MEDIUM'];
-                    
+
                     // If previous stint was SOFT, prefer harder compounds next
                     if (previousTireCompound === 'SOFT' && weather.condition === 'DRY') {
                         availableCompounds = ['MEDIUM', 'HARD']; // Harder after SOFT
                     } else if (previousTireCompound === 'HARD' && weather.condition === 'DRY' && lapsSinceLastPit > 25) {
                         availableCompounds = ['SOFT', 'MEDIUM']; // Softer for grip if stint was long
                     }
-                    
+
                     // CRITICAL: Never pick the same compound (no point in changing tires to same compound)
                     availableCompounds = availableCompounds.filter(c => c !== previousTireCompound);
                     // If all options filtered out, fall back to preferred options excluding previous
                     if (availableCompounds.length === 0) {
                         availableCompounds = tireChoices[weather.condition].filter(c => c !== previousTireCompound) || ['HARD'];
                     }
-                    
+
                     const newCompound = availableCompounds[Math.floor(Math.random() * availableCompounds.length)];
-                    
+
                     // Record pit and update tire strategy
                     tireStrategy.pitAndChangeCompound(
-                        actualLap, 
-                        newCompound, 
+                        actualLap,
+                        newCompound,
                         newPosition,
                         state.x,
                         weather.condition
                     );
-                    
+
                     // Update position to post-pit position
                     raceState.currentPosition = newPosition;
-                    
+
                     // Reset tire degradation state after pit
                     state.x = 0.0;
                     state.P = 1.0;
-                    
+
                     // Update tire compound AFTER logging previous one
                     currentTireCompound = newCompound;
-                    
+
                     // Reset laps counter for new stint
                     lapsSinceLastPit = 0;
-                    
+
                     // Log pit stop with detailed analysis - showing ACTUAL tire change
                     telemetryLog.log('');
                     telemetryLog.log(`\x1b[33m╔════════════════════════════════════════╗\x1b[0m`);
@@ -584,7 +597,7 @@ function startRaceSimulation() {
                     telemetryLog.log(`\x1b[33m╚════════════════════════════════════════╝\x1b[0m`);
                     telemetryLog.log('');
 
-                    
+
                     executePitStop = false;
                 }
 
@@ -594,7 +607,7 @@ function startRaceSimulation() {
                     // Tires degrade faster as they age (cliff effect)
                     const degradationMultiplier = tireStrategy.getDegradationCurveMultiplier(lapsSinceLastPit, currentTireCompound);
                     const adjustedDegradationDelta = degradationDelta * degradationMultiplier;
-                    
+
                     // C++ Update with age-adjusted degradation
                     const result = kalmanMath.updateState(
                         state.x, state.P, state.Q, state.R, state.wear_rate, adjustedDegradationDelta
@@ -613,8 +626,10 @@ function startRaceSimulation() {
                     const wearDisplay = `${result.x.toFixed(3)}s`;
                     const cliffDisplay = `${(result.cliffProb * 100).toFixed(0)}%`;
                     const fuelDisplay = `${fuelInfo.currentFuel}kg`;
-                    
-                    telemetryLog.log(`${lapDisplay} | ${tireDisplay.padEnd(12)} | Wear: ${wearDisplay} | Cliff: ${cliffDisplay} | Fuel: ${fuelDisplay}`);
+
+                    const paceDisplay = `${(compoundPaceDelta + wearPenalty).toFixed(2)}s/l`;
+
+                    telemetryLog.log(`${lapDisplay} | ${tireDisplay.padEnd(12)} | Pace: ${paceDisplay.padStart(6)} | Wear: ${wearDisplay} | Cliff: ${cliffDisplay} | Fuel: ${fuelDisplay}`);
 
                     // Update Chart Data
                     wearSeries.x.push(lapNumStr);

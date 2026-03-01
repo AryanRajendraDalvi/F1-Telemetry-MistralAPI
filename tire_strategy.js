@@ -7,10 +7,10 @@ class TireStrategy {
   constructor(driverName, startingCompound = null, startingPosition = 1) {
     this.driverName = driverName;
     this.stints = [];
-    
+
     // Randomize starting tire if not specified (50% SOFT, 30% MEDIUM, 20% HARD in DRY)
     const startCompound = startingCompound || this.getRandomStartingCompound();
-    
+
     this.currentStint = {
       stintNumber: 1,
       startLap: 1,
@@ -56,12 +56,28 @@ class TireStrategy {
   getDegradationCurveMultiplier(currentLap, compound) {
     const maxLaps = this.getMaxLaps(compound);
     const percentageOfLife = currentLap / maxLaps;
-    
+
     if (percentageOfLife < 0.3) return 1.0;      // Fresh tires, minimal wear
     if (percentageOfLife < 0.6) return 1.3;      // Linear wear phase
     if (percentageOfLife < 0.85) return 1.8;     // Entering degradation zone
     if (percentageOfLife < 0.95) return 2.5;     // Significant cliff
     return 4.0;                                   // Critical failure zone
+  }
+
+  /**
+   * Get the inherent pace advantage of a tire compound
+   * Returns: Time delta in seconds per lap (negative means faster)
+   */
+  getCompoundPaceAdvantage(compound) {
+    const paceMap = {
+      SOFT: -0.8,     // Softs are ~0.8s faster than Mediums
+      MEDIUM: 0.0,    // Mediums are the baseline pace
+      HARD: 0.6,      // Hards are ~0.6s slower than Mediums
+      WET: 12.0,      // Massive pace deficit to slicks in dry
+      INTERMEDIATE: 8.0,
+      EXTREME_WET: 18.0
+    };
+    return paceMap[compound] || 0.0;
   }
 
   /**
@@ -81,7 +97,7 @@ class TireStrategy {
   getTireWearStatus(lapsCompleted, compound) {
     const maxLaps = this.getMaxLaps(compound);
     const percent = lapsCompleted / maxLaps;
-    
+
     if (percent < 0.5) return 'FRESH';
     if (percent < 0.75) return 'NORMAL';
     if (percent < 0.85) return 'WARNING';
@@ -95,15 +111,15 @@ class TireStrategy {
     this.currentStint.currentDegradation = currentDegradation;
     this.currentStint.currentPosition = currentPosition;
     this.currentStint.weatherAtStart = weatherCondition;
-    
+
     // Calculate age relative to peak performance
     const maxLaps = this.getMaxLaps(this.currentStint.tireCompound);
     this.currentStint.ageRelativeToPeak = Math.min(lapsInCurrentStint / maxLaps, 1.0);
-    
+
     // Calculate effective degradation with tire age multiplier
     const curveMult = this.getDegradationCurveMultiplier(lapsInCurrentStint, this.currentStint.tireCompound);
     this.currentStint.effectiveDegradation = currentDegradation * curveMult;
-    
+
     // Track wear status for pit decision
     this.currentStint.wearStatus = this.getTireWearStatus(lapsInCurrentStint, this.currentStint.tireCompound);
   }
